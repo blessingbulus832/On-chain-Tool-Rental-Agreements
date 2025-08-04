@@ -60,6 +60,8 @@
         
         (try! (stx-transfer? total-cost tx-sender (get owner tool)))
         
+        (update-rental-history tool-id duration total-cost (get deposit-amount tool))
+        
         (map-set tools
             { tool-id: tool-id }
             (merge tool { available: false }))
@@ -83,6 +85,8 @@
         
         (asserts! (is-eq (get renter rental) tx-sender) ERR-NOT-AUTHORIZED)
         (asserts! (not (get returned rental)) ERR-TOOL-NOT-AVAILABLE)
+        
+        (complete-rental-history tool-id tx-sender)
         
         (map-set tools
             { tool-id: tool-id }
@@ -331,4 +335,145 @@
 
 (define-read-only (get-package-rental-info (package-id uint))
     (ok (map-get? package-rentals { package-id: package-id }))
+)
+
+(define-map rental-history
+    { renter: principal, rental-id: uint }
+    {
+        tool-id: uint,
+        start-time: uint,
+        duration: uint,
+        total-cost: uint,
+        deposit-paid: uint,
+        completed: bool
+    }
+)
+
+(define-map renter-stats
+    { renter: principal }
+    {
+        total-rentals: uint,
+        total-spent: uint,
+        active-rentals: uint
+    }
+)
+
+(define-map tool-stats
+    { tool-id: uint }
+    {
+        total-rentals: uint,
+        total-revenue: uint,
+        total-rental-days: uint
+    }
+)
+
+(define-map owner-stats
+    { owner: principal }
+    {
+        total-revenue: uint,
+        total-tools-rented: uint,
+        active-tool-rentals: uint
+    }
+)
+
+(define-data-var next-rental-id uint u1)
+
+(define-private (update-rental-history (tool-id uint) (duration uint) (total-cost uint) (deposit-paid uint))
+    (let
+        ((rental-id (var-get next-rental-id))
+         (current-renter-stats (default-to { total-rentals: u0, total-spent: u0, active-rentals: u0 }
+                               (map-get? renter-stats { renter: tx-sender })))
+         (current-tool-stats (default-to { total-rentals: u0, total-revenue: u0, total-rental-days: u0 }
+                             (map-get? tool-stats { tool-id: tool-id })))
+         (tool-owner (get owner (unwrap-panic (map-get? tools { tool-id: tool-id }))))
+         (current-owner-stats (default-to { total-revenue: u0, total-tools-rented: u0, active-tool-rentals: u0 }
+                              (map-get? owner-stats { owner: tool-owner }))))
+        
+        (var-set next-rental-id (+ rental-id u1))
+        
+        (map-set rental-history
+            { renter: tx-sender, rental-id: rental-id }
+            {
+                tool-id: tool-id,
+                start-time: stacks-block-height,
+                duration: duration,
+                total-cost: total-cost,
+                deposit-paid: deposit-paid,
+                completed: false
+            })
+            
+        (map-set renter-stats
+            { renter: tx-sender }
+            {
+                total-rentals: (+ (get total-rentals current-renter-stats) u1),
+                total-spent: (+ (get total-spent current-renter-stats) total-cost),
+                active-rentals: (+ (get active-rentals current-renter-stats) u1)
+            })
+            
+        (map-set tool-stats
+            { tool-id: tool-id }
+            {
+                total-rentals: (+ (get total-rentals current-tool-stats) u1),
+                total-revenue: (+ (get total-revenue current-tool-stats) total-cost),
+                total-rental-days: (+ (get total-rental-days current-tool-stats) duration)
+            })
+            
+        (map-set owner-stats
+            { owner: tool-owner }
+            {
+                total-revenue: (+ (get total-revenue current-owner-stats) total-cost),
+                total-tools-rented: (+ (get total-tools-rented current-owner-stats) u1),
+                active-tool-rentals: (+ (get active-tool-rentals current-owner-stats) u1)
+            })
+    )
+)
+
+(define-private (complete-rental-history (tool-id uint) (renter principal))
+    (let
+        ((rental-data (unwrap-panic (map-get? rentals { tool-id: tool-id })))
+         (current-renter-stats (unwrap-panic (map-get? renter-stats { renter: renter })))
+         (tool-owner (get owner (unwrap-panic (map-get? tools { tool-id: tool-id }))))
+         (current-owner-stats (unwrap-panic (map-get? owner-stats { owner: tool-owner }))))
+        
+        (map-set renter-stats
+            { renter: renter }
+            (merge current-renter-stats 
+                   { active-rentals: (- (get active-rentals current-renter-stats) u1) }))
+                   
+        (map-set owner-stats
+            { owner: tool-owner }
+            (merge current-owner-stats 
+                   { active-tool-rentals: (- (get active-tool-rentals current-owner-stats) u1) }))
+    )
+)
+
+(define-read-only (get-renter-history (renter principal) (start-id uint) (limit uint))
+    (ok (filter-rental-history renter start-id limit))
+)
+
+(define-read-only (get-renter-stats (renter principal))
+    (ok (map-get? renter-stats { renter: renter }))
+)
+
+(define-read-only (get-tool-stats (tool-id uint))
+    (ok (map-get? tool-stats { tool-id: tool-id }))
+)
+
+(define-read-only (get-owner-stats (owner principal))
+    (ok (map-get? owner-stats { owner: owner }))
+)
+
+(define-read-only (get-rental-by-id (renter principal) (rental-id uint))
+    (ok (map-get? rental-history { renter: renter, rental-id: rental-id }))
+)
+
+(define-private (filter-rental-history (renter principal) (start-id uint) (limit uint))
+    (let
+        ((end-id (+ start-id limit)))
+        (map get-rental-record (list start-id (+ start-id u1) (+ start-id u2) (+ start-id u3) (+ start-id u4)))
+    )
+)
+
+(define-private (get-rental-record (rental-id uint))
+    (map-get? rental-history { renter: tx-sender, rental-id: rental-id })
 )
