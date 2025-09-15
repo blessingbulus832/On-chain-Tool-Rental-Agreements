@@ -8,6 +8,7 @@
 (define-constant ERR-INSUFFICIENT-TOOLS (err u107))
 (define-constant ERR-TOOL-OWNERSHIP-MISMATCH (err u108))
 (define-constant ERR-PACKAGE-NOT-FOUND (err u109))
+(define-constant ERR-INVALID-SEASON (err u110))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -53,13 +54,16 @@
 (define-public (rent-tool (tool-id uint) (duration uint))
     (let
         ((tool (unwrap! (map-get? tools { tool-id: tool-id }) ERR-TOOL-NOT-FOUND))
-         (total-cost (+ (* (get daily-rate tool) duration) (get deposit-amount tool))))
+         (current-price (calculate-dynamic-price tool-id))
+         (total-cost (+ (* current-price duration) (get deposit-amount tool))))
         
         (asserts! (get available tool) ERR-TOOL-NOT-AVAILABLE)
         (asserts! (>= (stx-get-balance tx-sender) total-cost) ERR-INSUFFICIENT-FUNDS)
         
         (try! (stx-transfer? total-cost tx-sender (get owner tool)))
         
+        (update-tool-demand tool-id)
+        (update-tool-pricing tool-id)
         (update-rental-history tool-id duration total-cost (get deposit-amount tool))
         
         (map-set tools
@@ -476,4 +480,209 @@
 
 (define-private (get-rental-record (rental-id uint))
     (map-get? rental-history { renter: tx-sender, rental-id: rental-id })
+)
+
+(define-map tool-demand-metrics
+    { tool-id: uint }
+    {
+        recent-rentals: uint,
+        demand-score: uint,
+        last-updated-block: uint
+    }
+)
+
+(define-map seasonal-multipliers
+    { season: uint }
+    {
+        multiplier: uint,
+        active: bool
+    }
+)
+
+(define-map tool-dynamic-pricing
+    { tool-id: uint }
+    {
+        base-rate: uint,
+        current-rate: uint,
+        min-rate: uint,
+        max-rate: uint,
+        dynamic-enabled: bool
+    }
+)
+
+(define-data-var pricing-update-frequency uint u144)
+(define-data-var demand-decay-rate uint u90)
+(define-data-var max-price-increase uint u200)
+(define-data-var min-price-decrease uint u50)
+
+(define-public (enable-dynamic-pricing (tool-id uint) (min-rate uint) (max-rate uint))
+    (let
+        ((tool (unwrap! (map-get? tools { tool-id: tool-id }) ERR-TOOL-NOT-FOUND))
+         (base-rate (get daily-rate tool)))
+        
+        (asserts! (is-eq (get owner tool) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (< min-rate base-rate) ERR-INSUFFICIENT-FUNDS)
+        (asserts! (> max-rate base-rate) ERR-INSUFFICIENT-FUNDS)
+        
+        (ok (map-set tool-dynamic-pricing
+            { tool-id: tool-id }
+            {
+                base-rate: base-rate,
+                current-rate: base-rate,
+                min-rate: min-rate,
+                max-rate: max-rate,
+                dynamic-enabled: true
+            }))
+    )
+)
+
+(define-public (disable-dynamic-pricing (tool-id uint))
+    (let
+        ((tool (unwrap! (map-get? tools { tool-id: tool-id }) ERR-TOOL-NOT-FOUND))
+         (pricing (unwrap! (map-get? tool-dynamic-pricing { tool-id: tool-id }) ERR-TOOL-NOT-FOUND)))
+        
+        (asserts! (is-eq (get owner tool) tx-sender) ERR-NOT-AUTHORIZED)
+        
+        (map-set tools
+            { tool-id: tool-id }
+            (merge tool { daily-rate: (get base-rate pricing) }))
+            
+        (ok (map-set tool-dynamic-pricing
+            { tool-id: tool-id }
+            (merge pricing { dynamic-enabled: false })))
+    )
+)
+
+(define-public (set-seasonal-multiplier (season uint) (multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= season u1) (<= season u4)) ERR-INVALID-SEASON)
+        (asserts! (and (>= multiplier u25) (<= multiplier u300)) ERR-INSUFFICIENT-FUNDS)
+        
+        (ok (map-set seasonal-multipliers
+            { season: season }
+            {
+                multiplier: multiplier,
+                active: true
+            }))
+    )
+)
+
+(define-private (update-tool-demand (tool-id uint))
+    (let
+        ((current-metrics (default-to 
+                          { recent-rentals: u0, demand-score: u0, last-updated-block: u0 }
+                          (map-get? tool-demand-metrics { tool-id: tool-id })))
+         (blocks-passed (- stacks-block-height (get last-updated-block current-metrics)))
+         (decay-factor (if (> blocks-passed (var-get demand-decay-rate)) u1 u0))
+         (new-recent-rentals (if (is-eq decay-factor u1) 
+                            u1 
+                            (+ (get recent-rentals current-metrics) u1)))
+         (new-demand-score (calculate-demand-score new-recent-rentals)))
+        
+        (map-set tool-demand-metrics
+            { tool-id: tool-id }
+            {
+                recent-rentals: new-recent-rentals,
+                demand-score: new-demand-score,
+                last-updated-block: stacks-block-height
+            })
+    )
+)
+
+(define-private (calculate-demand-score (recent-rentals uint))
+    (if (<= recent-rentals u2)
+        u0
+        (if (<= recent-rentals u5)
+            u25
+            (if (<= recent-rentals u10)
+                u50
+                (if (<= recent-rentals u20)
+                    u100
+                    u150))))
+)
+
+(define-private (calculate-dynamic-price (tool-id uint))
+    (let
+        ((pricing (unwrap! (map-get? tool-dynamic-pricing { tool-id: tool-id }) (get daily-rate (unwrap-panic (map-get? tools { tool-id: tool-id })))))
+         (demand-metrics (default-to { recent-rentals: u0, demand-score: u0, last-updated-block: u0 }
+                         (map-get? tool-demand-metrics { tool-id: tool-id })))
+         (current-season (get-current-season))
+         (season-multiplier (get multiplier (default-to { multiplier: u100, active: false }
+                            (map-get? seasonal-multipliers { season: current-season }))))
+         (base-rate (get base-rate pricing))
+         (demand-score (get demand-score demand-metrics))
+         (demand-adjustment (/ (* base-rate demand-score) u100))
+         (seasonal-adjustment (/ (* base-rate (- season-multiplier u100)) u100))
+         (new-rate (+ base-rate demand-adjustment seasonal-adjustment))
+         (capped-rate (if (> new-rate (get max-rate pricing))
+                         (get max-rate pricing)
+                         (if (< new-rate (get min-rate pricing))
+                             (get min-rate pricing)
+                             new-rate))))
+        
+        (if (get dynamic-enabled pricing)
+            capped-rate
+            base-rate)
+    )
+)
+
+(define-private (get-current-season)
+    (let
+        ((block-remainder (mod stacks-block-height u8640)))
+        (if (< block-remainder u2160)
+            u1
+            (if (< block-remainder u4320)
+                u2
+                (if (< block-remainder u6480)
+                    u3
+                    u4)))
+    )
+)
+
+(define-private (update-tool-pricing (tool-id uint))
+    (let
+        ((tool (unwrap-panic (map-get? tools { tool-id: tool-id })))
+         (pricing (map-get? tool-dynamic-pricing { tool-id: tool-id }))
+         (new-rate (calculate-dynamic-price tool-id)))
+        
+        (match pricing
+            some-pricing
+            (begin
+                (map-set tool-dynamic-pricing
+                    { tool-id: tool-id }
+                    (merge some-pricing { current-rate: new-rate }))
+                (map-set tools
+                    { tool-id: tool-id }
+                    (merge tool { daily-rate: new-rate })))
+            (map-set tools
+                { tool-id: tool-id }
+                tool))
+    )
+)
+
+(define-read-only (get-tool-current-price (tool-id uint))
+    (ok (calculate-dynamic-price tool-id))
+)
+
+(define-read-only (get-tool-demand-metrics (tool-id uint))
+    (ok (map-get? tool-demand-metrics { tool-id: tool-id }))
+)
+
+(define-read-only (get-tool-pricing-info (tool-id uint))
+    (ok (map-get? tool-dynamic-pricing { tool-id: tool-id }))
+)
+
+(define-read-only (get-seasonal-multiplier (season uint))
+    (ok (map-get? seasonal-multipliers { season: season }))
+)
+
+(define-read-only (get-current-season-info)
+    (let
+        ((current-season (get-current-season)))
+        (ok { 
+            current-season: current-season,
+            multiplier-info: (map-get? seasonal-multipliers { season: current-season })
+        })
+    )
 )
