@@ -9,6 +9,9 @@
 (define-constant ERR-TOOL-OWNERSHIP-MISMATCH (err u108))
 (define-constant ERR-PACKAGE-NOT-FOUND (err u109))
 (define-constant ERR-INVALID-SEASON (err u110))
+(define-constant ERR-INSUFFICIENT-POINTS (err u111))
+(define-constant ERR-REWARD-NOT-FOUND (err u112))
+(define-constant ERR-REWARD-NOT-AVAILABLE (err u113))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -683,6 +686,191 @@
         (ok { 
             current-season: current-season,
             multiplier-info: (map-get? seasonal-multipliers { season: current-season })
+        })
+    )
+)
+
+(define-map loyalty-points
+    { member: principal }
+    {
+        total-points: uint,
+        points-spent: uint,
+        tier: uint,
+        tier-name: (string-ascii 20),
+        discount-percentage: uint
+    }
+)
+
+(define-map loyalty-rewards
+    { reward-id: uint }
+    {
+        name: (string-ascii 50),
+        points-cost: uint,
+        discount-percentage: uint,
+        validity-blocks: uint,
+        available: bool
+    }
+)
+
+(define-map active-rewards
+    { member: principal, reward-id: uint }
+    {
+        activation-block: uint,
+        expiry-block: uint,
+        used: bool
+    }
+)
+
+(define-data-var next-reward-id uint u1)
+(define-data-var points-per-stx uint u10)
+
+(define-private (award-loyalty-points (member principal) (amount-spent uint))
+    (let
+        ((current-loyalty (default-to 
+            { total-points: u0, points-spent: u0, tier: u0, tier-name: "Bronze", discount-percentage: u0 }
+            (map-get? loyalty-points { member: member })))
+         (points-earned (/ (* amount-spent (var-get points-per-stx)) u1000000))
+         (new-total-points (+ (get total-points current-loyalty) points-earned))
+         (new-tier-info (calculate-loyalty-tier new-total-points)))
+        
+        (map-set loyalty-points
+            { member: member }
+            {
+                total-points: new-total-points,
+                points-spent: (get points-spent current-loyalty),
+                tier: (get tier new-tier-info),
+                tier-name: (get tier-name new-tier-info),
+                discount-percentage: (get discount new-tier-info)
+            })
+    )
+)
+
+(define-private (calculate-loyalty-tier (points uint))
+    (if (>= points u10000)
+        { tier: u4, tier-name: "Diamond", discount: u20 }
+        (if (>= points u5000)
+            { tier: u3, tier-name: "Gold", discount: u15 }
+            (if (>= points u2000)
+                { tier: u2, tier-name: "Silver", discount: u10 }
+                { tier: u1, tier-name: "Bronze", discount: u5 })))
+)
+
+(define-public (create-loyalty-reward (name (string-ascii 50)) (points-cost uint) (discount-percentage uint) (validity-blocks uint))
+    (let
+        ((reward-id (var-get next-reward-id)))
+        
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        
+        (var-set next-reward-id (+ reward-id u1))
+        
+        (ok (map-set loyalty-rewards
+            { reward-id: reward-id }
+            {
+                name: name,
+                points-cost: points-cost,
+                discount-percentage: discount-percentage,
+                validity-blocks: validity-blocks,
+                available: true
+            }))
+    )
+)
+
+(define-public (redeem-loyalty-reward (reward-id uint))
+    (let
+        ((reward (unwrap! (map-get? loyalty-rewards { reward-id: reward-id }) ERR-REWARD-NOT-FOUND))
+         (loyalty (unwrap! (map-get? loyalty-points { member: tx-sender }) ERR-INSUFFICIENT-POINTS))
+         (available-points (- (get total-points loyalty) (get points-spent loyalty))))
+        
+        (asserts! (get available reward) ERR-REWARD-NOT-AVAILABLE)
+        (asserts! (>= available-points (get points-cost reward)) ERR-INSUFFICIENT-POINTS)
+        
+        (map-set loyalty-points
+            { member: tx-sender }
+            (merge loyalty { points-spent: (+ (get points-spent loyalty) (get points-cost reward)) }))
+            
+        (ok (map-set active-rewards
+            { member: tx-sender, reward-id: reward-id }
+            {
+                activation-block: stacks-block-height,
+                expiry-block: (+ stacks-block-height (get validity-blocks reward)),
+                used: false
+            }))
+    )
+)
+
+(define-public (apply-loyalty-discount (tool-id uint) (duration uint))
+    (let
+        ((tool (unwrap! (map-get? tools { tool-id: tool-id }) ERR-TOOL-NOT-FOUND))
+         (loyalty (default-to 
+            { total-points: u0, points-spent: u0, tier: u0, tier-name: "Bronze", discount-percentage: u0 }
+            (map-get? loyalty-points { member: tx-sender })))
+         (current-price (calculate-dynamic-price tool-id))
+         (base-total (+ (* current-price duration) (get deposit-amount tool)))
+         (tier-discount (/ (* base-total (get discount-percentage loyalty)) u100))
+         (discounted-total (- base-total tier-discount)))
+        
+        (asserts! (get available tool) ERR-TOOL-NOT-AVAILABLE)
+        (asserts! (>= (stx-get-balance tx-sender) discounted-total) ERR-INSUFFICIENT-FUNDS)
+        
+        (try! (stx-transfer? discounted-total tx-sender (get owner tool)))
+        
+        (award-loyalty-points tx-sender discounted-total)
+        (update-tool-demand tool-id)
+        (update-tool-pricing tool-id)
+        (update-rental-history tool-id duration discounted-total (get deposit-amount tool))
+        
+        (map-set tools
+            { tool-id: tool-id }
+            (merge tool { available: false }))
+            
+        (ok (map-set rentals
+            { tool-id: tool-id }
+            {
+                renter: tx-sender,
+                start-time: stacks-block-height,
+                duration: duration,
+                deposit-paid: (get deposit-amount tool),
+                returned: false
+            }))
+    )
+)
+
+(define-public (set-points-per-stx (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (var-set points-per-stx new-rate))
+    )
+)
+
+(define-read-only (get-loyalty-points (member principal))
+    (ok (map-get? loyalty-points { member: member }))
+)
+
+(define-read-only (get-loyalty-reward (reward-id uint))
+    (ok (map-get? loyalty-rewards { reward-id: reward-id }))
+)
+
+(define-read-only (get-active-reward (member principal) (reward-id uint))
+    (ok (map-get? active-rewards { member: member, reward-id: reward-id }))
+)
+
+(define-read-only (calculate-rental-with-discount (tool-id uint) (duration uint) (member principal))
+    (let
+        ((tool (unwrap! (map-get? tools { tool-id: tool-id }) ERR-TOOL-NOT-FOUND))
+         (loyalty (default-to 
+            { total-points: u0, points-spent: u0, tier: u0, tier-name: "Bronze", discount-percentage: u0 }
+            (map-get? loyalty-points { member: member })))
+         (current-price (calculate-dynamic-price tool-id))
+         (base-total (+ (* current-price duration) (get deposit-amount tool)))
+         (tier-discount (/ (* base-total (get discount-percentage loyalty)) u100))
+         (discounted-total (- base-total tier-discount)))
+        
+        (ok {
+            base-total: base-total,
+            discount-amount: tier-discount,
+            final-total: discounted-total,
+            tier: (get tier-name loyalty),
+            discount-percentage: (get discount-percentage loyalty)
         })
     )
 )
