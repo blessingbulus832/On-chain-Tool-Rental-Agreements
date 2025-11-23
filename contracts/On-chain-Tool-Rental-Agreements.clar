@@ -12,6 +12,9 @@
 (define-constant ERR-INSUFFICIENT-POINTS (err u111))
 (define-constant ERR-REWARD-NOT-FOUND (err u112))
 (define-constant ERR-REWARD-NOT-AVAILABLE (err u113))
+(define-constant ERR-INSURANCE-REQUIRED (err u114))
+(define-constant ERR-CLAIM-EXISTS (err u115))
+(define-constant ERR-INVALID-CLAIM (err u116))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -873,4 +876,190 @@
             discount-percentage: (get discount-percentage loyalty)
         })
     )
+)
+
+(define-map insurance-coverage
+    { tool-id: uint, renter: principal }
+    {
+        coverage-level: uint,
+        premium-paid: uint,
+        coverage-amount: uint,
+        active: bool,
+        purchase-block: uint
+    }
+)
+
+(define-map damage-claims
+    { claim-id: uint }
+    {
+        tool-id: uint,
+        claimant: principal,
+        renter: principal,
+        damage-amount: uint,
+        status: uint,
+        filed-block: uint,
+        resolved-block: uint,
+        payout-amount: uint
+    }
+)
+
+(define-data-var next-claim-id uint u1)
+(define-data-var basic-coverage-rate uint u5)
+(define-data-var standard-coverage-rate uint u10)
+(define-data-var premium-coverage-rate uint u15)
+
+(define-public (purchase-insurance (tool-id uint) (coverage-level uint))
+    (let
+        ((tool (unwrap! (map-get? tools { tool-id: tool-id }) ERR-TOOL-NOT-FOUND))
+         (rental (unwrap! (map-get? rentals { tool-id: tool-id }) ERR-NO-ACTIVE-RENTAL))
+         (premium-rate (if (is-eq coverage-level u1)
+                         (var-get basic-coverage-rate)
+                         (if (is-eq coverage-level u2)
+                             (var-get standard-coverage-rate)
+                             (var-get premium-coverage-rate))))
+         (coverage-multiplier (if (is-eq coverage-level u1)
+                                u50
+                                (if (is-eq coverage-level u2)
+                                    u75
+                                    u100)))
+         (premium-amount (/ (* (get deposit-amount tool) premium-rate) u100))
+         (coverage-amount (/ (* (get deposit-amount tool) coverage-multiplier) u100)))
+        
+        (asserts! (is-eq (get renter rental) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get returned rental)) ERR-NO-ACTIVE-RENTAL)
+        (asserts! (and (>= coverage-level u1) (<= coverage-level u3)) ERR-INSUFFICIENT-FUNDS)
+        (asserts! (>= (stx-get-balance tx-sender) premium-amount) ERR-INSUFFICIENT-FUNDS)
+        
+        (try! (stx-transfer? premium-amount tx-sender (get owner tool)))
+        
+        (ok (map-set insurance-coverage
+            { tool-id: tool-id, renter: tx-sender }
+            {
+                coverage-level: coverage-level,
+                premium-paid: premium-amount,
+                coverage-amount: coverage-amount,
+                active: true,
+                purchase-block: stacks-block-height
+            }))
+    )
+)
+
+(define-public (file-damage-claim (tool-id uint) (renter principal) (damage-amount uint))
+    (let
+        ((tool (unwrap! (map-get? tools { tool-id: tool-id }) ERR-TOOL-NOT-FOUND))
+         (rental (unwrap! (map-get? rentals { tool-id: tool-id }) ERR-NO-ACTIVE-RENTAL))
+         (insurance (map-get? insurance-coverage { tool-id: tool-id, renter: renter }))
+         (claim-id (var-get next-claim-id)))
+        
+        (asserts! (is-eq (get owner tool) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get renter rental) renter) ERR-NOT-AUTHORIZED)
+        (asserts! (get returned rental) ERR-NO-ACTIVE-RENTAL)
+        (asserts! (<= damage-amount (get deposit-amount tool)) ERR-INSUFFICIENT-FUNDS)
+        
+        (var-set next-claim-id (+ claim-id u1))
+        
+        (ok (map-set damage-claims
+            { claim-id: claim-id }
+            {
+                tool-id: tool-id,
+                claimant: tx-sender,
+                renter: renter,
+                damage-amount: damage-amount,
+                status: u0,
+                filed-block: stacks-block-height,
+                resolved-block: u0,
+                payout-amount: u0
+            }))
+    )
+)
+
+(define-public (process-damage-claim (claim-id uint) (approved bool))
+    (let
+        ((claim (unwrap! (map-get? damage-claims { claim-id: claim-id }) ERR-INVALID-CLAIM))
+         (tool (unwrap! (map-get? tools { tool-id: (get tool-id claim) }) ERR-TOOL-NOT-FOUND))
+         (rental (unwrap! (map-get? rentals { tool-id: (get tool-id claim) }) ERR-NO-ACTIVE-RENTAL))
+         (insurance (map-get? insurance-coverage { tool-id: (get tool-id claim), renter: (get renter claim) }))
+         (payout-amount (if approved
+                          (match insurance
+                              coverage-data
+                              (let
+                                  ((coverage-pct (if (is-eq (get coverage-level coverage-data) u1)
+                                                   u50
+                                                   (if (is-eq (get coverage-level coverage-data) u2)
+                                                       u75
+                                                       u100)))
+                                   (max-payout (/ (* (get damage-amount claim) coverage-pct) u100)))
+                                  max-payout)
+                              (get damage-amount claim))
+                          u0)))
+        
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status claim) u0) ERR-CLAIM-EXISTS)
+        
+        (if (and approved (> payout-amount u0))
+            (try! (stx-transfer? payout-amount (get owner tool) (get claimant claim)))
+            true)
+        
+        (ok (map-set damage-claims
+            { claim-id: claim-id }
+            (merge claim {
+                status: (if approved u1 u2),
+                resolved-block: stacks-block-height,
+                payout-amount: payout-amount
+            })))
+    )
+)
+
+(define-public (set-coverage-rates (basic uint) (standard uint) (premium uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= basic u1) (<= basic u20)) ERR-INSUFFICIENT-FUNDS)
+        (asserts! (and (>= standard u5) (<= standard u30)) ERR-INSUFFICIENT-FUNDS)
+        (asserts! (and (>= premium u10) (<= premium u40)) ERR-INSUFFICIENT-FUNDS)
+        
+        (var-set basic-coverage-rate basic)
+        (var-set standard-coverage-rate standard)
+        (ok (var-set premium-coverage-rate premium))
+    )
+)
+
+(define-read-only (get-insurance-coverage (tool-id uint) (renter principal))
+    (ok (map-get? insurance-coverage { tool-id: tool-id, renter: renter }))
+)
+
+(define-read-only (get-damage-claim (claim-id uint))
+    (ok (map-get? damage-claims { claim-id: claim-id }))
+)
+
+(define-read-only (calculate-insurance-premium (tool-id uint) (coverage-level uint))
+    (let
+        ((tool (unwrap! (map-get? tools { tool-id: tool-id }) ERR-TOOL-NOT-FOUND))
+         (premium-rate (if (is-eq coverage-level u1)
+                         (var-get basic-coverage-rate)
+                         (if (is-eq coverage-level u2)
+                             (var-get standard-coverage-rate)
+                             (var-get premium-coverage-rate))))
+         (coverage-multiplier (if (is-eq coverage-level u1)
+                                u50
+                                (if (is-eq coverage-level u2)
+                                    u75
+                                    u100)))
+         (premium-amount (/ (* (get deposit-amount tool) premium-rate) u100))
+         (coverage-amount (/ (* (get deposit-amount tool) coverage-multiplier) u100)))
+        
+        (ok {
+            coverage-level: coverage-level,
+            premium-amount: premium-amount,
+            coverage-amount: coverage-amount,
+            deposit-amount: (get deposit-amount tool)
+        })
+    )
+)
+
+(define-read-only (get-coverage-rates)
+    (ok {
+        basic: (var-get basic-coverage-rate),
+        standard: (var-get standard-coverage-rate),
+        premium: (var-get premium-coverage-rate)
+    })
 )
